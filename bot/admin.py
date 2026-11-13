@@ -22,7 +22,7 @@ from .config import Config, parse_channel_id
 from .db import Database
 from .handlers import is_subscribed
 from .manager import BotManager
-from .texts import CHOOSE_KEY, GLOBAL, KEY_LABELS, Texts
+from .texts import KEY_LABELS, Texts
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ _background: set[asyncio.Task] = set()
 class AddBot(StatesGroup):
     source = State()
     token = State()
+    language = State()
     channel_id = State()
     channel_url = State()
 
@@ -79,12 +80,10 @@ async def show(event: Message | CallbackQuery, text: str, markup: InlineKeyboard
 
 
 def text_label(language: str, key: str) -> str:
-    return "Приглашение выбрать язык" if language == GLOBAL else KEY_LABELS[key]
+    return KEY_LABELS[key]
 
 
 def valid_text_ref(texts: Texts, language: str, key: str) -> bool:
-    if language == GLOBAL:
-        return key == CHOOSE_KEY
     return language in texts.languages and key in KEY_LABELS
 
 
@@ -129,7 +128,7 @@ def build_admin_router(cfg: Config) -> Router:
     # --- статистика -------------------------------------------------------
 
     @router.callback_query(F.data == "stats")
-    async def on_stats(callback: CallbackQuery, db: Database, texts: Texts) -> None:
+    async def on_stats(callback: CallbackQuery, db: Database) -> None:
         s = await db.stats()
         pools = [b["source"] for b in await db.list_bots()]
         pools += sorted((set(s["participants"]) | set(s["started"])) - set(pools))
@@ -146,12 +145,6 @@ def build_admin_router(cfg: Config) -> Router:
             )
         if not pools:
             lines.append("Пока нет ни ботов, ни участников.")
-        if s["languages"]:
-            lines += ["", "<b>Языки интерфейса участников</b>"]
-            lines += [
-                f"{escape(texts.languages.get(code, code))}: {count}"
-                for code, count in sorted(s["languages"].items(), key=lambda x: -x[1])
-            ]
         lines += ["", "<i>«Отписались» обновляется кнопкой «Перепроверить подписки».</i>"]
         await show(callback, "\n".join(lines), kb([("🔄 Обновить", "stats")], BACK_MENU))
 
@@ -162,14 +155,16 @@ def build_admin_router(cfg: Config) -> Router:
         rows = []
         for b in await db.list_bots():
             mark = "🟢" if manager.is_running(b["source"]) else ("🔴" if b["is_active"] else "⏸")
-            rows.append([(f"{mark} {b['source']} — @{b['username']}", f"bot:{b['source']}")])
+            rows.append(
+                [(f"{mark} {b['source']} · {b['language']} — @{b['username']}", f"bot:{b['source']}")]
+            )
         await show(
             callback,
             "<b>Боты розыгрыша</b>\n\n🟢 работает · ⏸ выключен · 🔴 включён, но не запущен (ошибка)",
             kb(*rows, [("➕ Добавить бота", "bot_add")], BACK_MENU),
         )
 
-    async def bot_card(event, db: Database, manager: BotManager, source: str) -> None:
+    async def bot_card(event, db: Database, texts: Texts, manager: BotManager, source: str) -> None:
         b = await db.get_bot(source)
         if not b:
             await show(event, "Бот не найден.", kb([("« Боты", "bots")]))
@@ -185,23 +180,49 @@ def build_admin_router(cfg: Config) -> Router:
             event,
             f"<b>Бот {escape(source)}</b> — @{escape(b['username'] or '?')}\n\n"
             f"Статус: {status}\n"
+            f"Язык: {escape(texts.languages.get(b['language'], b['language']))}\n"
             f"Канал: <code>{escape(b['channel_id'])}</code>\n"
             f"Ссылка: {escape(b['channel_url'])}\n"
             f"Участников в пуле: {count}",
             kb(
                 [("⏸ Выключить" if b["is_active"] else "▶️ Включить", f"bot_toggle:{source}")],
-                [("✏️ Изменить канал", f"bot_chan:{source}")],
+                [("🌐 Изменить язык", f"bot_lang:{source}"), ("✏️ Изменить канал", f"bot_chan:{source}")],
                 [("🗑 Удалить", f"bot_del:{source}")],
                 [("« Боты", "bots")],
             ),
         )
 
     @router.callback_query(F.data.startswith("bot:"))
-    async def on_bot(callback: CallbackQuery, db: Database, manager: BotManager) -> None:
-        await bot_card(callback, db, manager, callback.data.split(":", 1)[1])
+    async def on_bot(callback: CallbackQuery, db: Database, texts: Texts, manager: BotManager) -> None:
+        await bot_card(callback, db, texts, manager, callback.data.split(":", 1)[1])
+
+    @router.callback_query(F.data.startswith("bot_lang:"))
+    async def on_bot_lang(callback: CallbackQuery, texts: Texts) -> None:
+        source = callback.data.split(":", 1)[1]
+        rows = [[(title, f"bl:{source}:{code}")] for code, title in texts.languages.items()]
+        await show(
+            callback,
+            f"<b>Язык бота {escape(source)}</b>\n\nБот будет отвечать только на выбранном языке.",
+            kb(*rows, [("Отмена", f"bot:{source}")]),
+        )
+
+    @router.callback_query(F.data.startswith("bl:"))
+    async def on_bot_lang_set(
+        callback: CallbackQuery, db: Database, texts: Texts, manager: BotManager
+    ) -> None:
+        _, source, code = callback.data.split(":", 2)
+        row = await db.get_bot(source)
+        if row and code in texts.languages and code != row["language"]:
+            await db.set_bot_language(source, code)
+            if manager.is_running(source):
+                await manager.start(await db.get_bot(source))  # перезапуск с новым языком
+                await asyncio.sleep(1)
+        await bot_card(callback, db, texts, manager, source)
 
     @router.callback_query(F.data.startswith("bot_toggle:"))
-    async def on_bot_toggle(callback: CallbackQuery, db: Database, manager: BotManager) -> None:
+    async def on_bot_toggle(
+        callback: CallbackQuery, db: Database, texts: Texts, manager: BotManager
+    ) -> None:
         source = callback.data.split(":", 1)[1]
         b = await db.get_bot(source)
         if b:
@@ -211,7 +232,7 @@ def build_admin_router(cfg: Config) -> Router:
             else:
                 await manager.start(b)
                 await asyncio.sleep(1)  # дать поллингу стартовать, чтобы показать верный статус
-        await bot_card(callback, db, manager, source)
+        await bot_card(callback, db, texts, manager, source)
 
     @router.callback_query(F.data.startswith("bot_del:"))
     async def on_bot_del(callback: CallbackQuery) -> None:
@@ -237,7 +258,7 @@ def build_admin_router(cfg: Config) -> Router:
         await state.set_state(AddBot.source)
         await show(
             callback,
-            "<b>Новый бот · шаг 1/4</b>\n\nПришлите код пула (source_channel), "
+            "<b>Новый бот · шаг 1/5</b>\n\nПришлите код пула (source_channel), "
             "например <code>RU</code>, <code>EN</code>, <code>PT</code>, <code>ES</code>.\n"
             "Латиница и цифры, до 10 символов.",
             CANCEL,
@@ -255,13 +276,13 @@ def build_admin_router(cfg: Config) -> Router:
         await state.update_data(source=source)
         await state.set_state(AddBot.token)
         await message.answer(
-            "<b>Шаг 2/4</b>\n\nПришлите токен бота от @BotFather. "
+            "<b>Шаг 2/5</b>\n\nПришлите токен бота от @BotFather. "
             "Сообщение с токеном я удалю из чата.",
             reply_markup=CANCEL,
         )
 
     @router.message(AddBot.token, F.text)
-    async def add_bot_token(message: Message, state: FSMContext) -> None:
+    async def add_bot_token(message: Message, state: FSMContext, texts: Texts) -> None:
         token = message.text.strip()
         try:
             await message.delete()
@@ -279,14 +300,31 @@ def build_admin_router(cfg: Config) -> Router:
         finally:
             await probe.session.close()
         await state.update_data(token=token, username=me.username)
-        await state.set_state(AddBot.channel_id)
+        await state.set_state(AddBot.language)
+        rows = [[(title, f"al:{code}")] for code, title in texts.languages.items()]
         await message.answer(
-            f"Бот найден: @{me.username}\n\n<b>Шаг 3/4</b>\n\n"
+            f"Бот найден: @{me.username}\n\n<b>Шаг 3/5</b>\n\n"
+            "Выберите язык бота. Бот будет отвечать только на нём.",
+            reply_markup=kb(*rows, [("Отмена", "menu")]),
+        )
+
+    @router.callback_query(AddBot.language, F.data.startswith("al:"))
+    async def add_bot_language(callback: CallbackQuery, state: FSMContext, texts: Texts) -> None:
+        code = callback.data.split(":", 1)[1]
+        if code not in texts.languages:
+            await callback.answer("Язык не найден")
+            return
+        username = (await state.get_data())["username"]
+        await state.update_data(language=code)
+        await state.set_state(AddBot.channel_id)
+        await show(
+            callback,
+            f"Язык: {escape(texts.languages[code])}\n\n<b>Шаг 4/5</b>\n\n"
             "Пришлите канал для проверки подписки: <code>@username</code> "
             "или числовой id (<code>-100…</code>).\n\n"
-            f"⚠️ @{me.username} должен быть администратором этого канала, "
+            f"⚠️ @{username} должен быть администратором этого канала, "
             "иначе проверка подписки не работает.",
-            reply_markup=CANCEL,
+            CANCEL,
         )
 
     def read_channel_id(text: str) -> str | None:
@@ -306,7 +344,7 @@ def build_admin_router(cfg: Config) -> Router:
         editing = await state.get_state() == EditChannel.channel_id.state
         await state.set_state(EditChannel.channel_url if editing else AddBot.channel_url)
         await message.answer(
-            ("" if editing else "<b>Шаг 4/4</b>\n\n")
+            ("" if editing else "<b>Шаг 5/5</b>\n\n")
             + "Пришлите ссылку для кнопки «Подписаться», например <code>https://t.me/channel</code>.",
             reply_markup=CANCEL,
         )
@@ -343,7 +381,9 @@ def build_admin_router(cfg: Config) -> Router:
             await db.update_bot_channel(source, data["channel_id"], url)
             head = f"Канал бота <b>{escape(source)}</b> обновлён."
         else:
-            if not await db.add_bot(source, data["token"], data["username"], data["channel_id"], url):
+            if not await db.add_bot(
+                source, data["token"], data["username"], data["channel_id"], url, data["language"]
+            ):
                 await state.clear()
                 await message.answer(
                     "Бот с таким кодом или токеном уже добавлен.", reply_markup=kb([("« Боты", "bots")])
@@ -377,13 +417,9 @@ def build_admin_router(cfg: Config) -> Router:
         rows = [[(title, f"tl:{code}")] for code, title in texts.languages.items()]
         await show(
             callback,
-            "<b>Тексты и языки</b>\n\nВыберите язык, чтобы править его фразы.",
-            kb(
-                *rows,
-                [("💬 Приглашение выбрать язык", f"tk:{GLOBAL}:{CHOOSE_KEY}")],
-                [("➕ Добавить язык", "lang_add")],
-                BACK_MENU,
-            ),
+            "<b>Тексты и языки</b>\n\nВыберите язык, чтобы править его фразы. "
+            "Язык каждому боту назначается в разделе «Боты».",
+            kb(*rows, [("➕ Добавить язык", "lang_add")], BACK_MENU),
         )
 
     @router.callback_query(F.data.startswith("tl:"))
@@ -404,7 +440,7 @@ def build_admin_router(cfg: Config) -> Router:
         )
 
     async def text_card(event, texts: Texts, language: str, key: str) -> None:
-        back = ("« Назад", "texts" if language == GLOBAL else f"tl:{language}")
+        back = ("« Назад", f"tl:{language}")
         state_note = "изменён" if texts.is_overridden(language, key) else "стандартный"
         await show(
             event,
@@ -467,7 +503,7 @@ def build_admin_router(cfg: Config) -> Router:
             return
         await texts.set(language, key, value)
         await state.clear()
-        await message.answer("Сохранено ✅ Изменение уже действует во всех ботах.")
+        await message.answer("Сохранено ✅ Изменение уже действует в ботах на этом языке.")
         await text_card(message, texts, language, key)
 
     # языки
@@ -491,7 +527,7 @@ def build_admin_router(cfg: Config) -> Router:
         await state.update_data(code=code)
         await state.set_state(AddLanguage.title)
         await message.answer(
-            "<b>Шаг 2/2</b>\n\nПришлите название для кнопки выбора языка, "
+            "<b>Шаг 2/2</b>\n\nПришлите название языка для админки, "
             "например <code>🇩🇪 Deutsch</code>."
         )
 
@@ -504,13 +540,20 @@ def build_admin_router(cfg: Config) -> Router:
         await message.answer(
             f"Язык {escape(title)} добавлен ✅\n\n"
             "Пока фразы не переведены, для него показываются английские тексты — "
-            "задайте свои в его разделе.",
+            "задайте свои в его разделе, затем назначьте язык боту.",
             reply_markup=kb([("Открыть фразы", f"tl:{code}")], [("« Языки", "texts")]),
         )
 
     @router.callback_query(F.data.startswith("lang_del:"))
-    async def on_lang_del(callback: CallbackQuery, texts: Texts) -> None:
+    async def on_lang_del(callback: CallbackQuery, db: Database, texts: Texts) -> None:
         code = callback.data.split(":", 1)[1]
+        used_by = [b["source"] for b in await db.list_bots() if b["language"] == code]
+        if used_by:
+            await callback.answer(
+                f"Язык используется ботами: {', '.join(used_by)}. Сначала смените им язык.",
+                show_alert=True,
+            )
+            return
         if len(texts.languages) <= 1:
             await callback.answer("Нельзя удалить единственный язык", show_alert=True)
             return
@@ -521,9 +564,13 @@ def build_admin_router(cfg: Config) -> Router:
         )
 
     @router.callback_query(F.data.startswith("lang_del_ok:"))
-    async def on_lang_del_ok(callback: CallbackQuery, state: FSMContext, texts: Texts) -> None:
-        if len(texts.languages) > 1:
-            await texts.delete_language(callback.data.split(":", 1)[1])
+    async def on_lang_del_ok(
+        callback: CallbackQuery, state: FSMContext, db: Database, texts: Texts
+    ) -> None:
+        code = callback.data.split(":", 1)[1]
+        in_use = any(b["language"] == code for b in await db.list_bots())
+        if len(texts.languages) > 1 and not in_use:
+            await texts.delete_language(code)
         await on_texts(callback, state, texts)
 
     # --- экспорт ----------------------------------------------------------

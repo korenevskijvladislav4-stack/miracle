@@ -50,6 +50,7 @@ class BotManager:
                 db=self.db,
                 texts=self.texts,
                 source=source,
+                language=row["language"],
                 channel_id=parse_channel_id(row["channel_id"]),
                 channel_url=row["channel_url"],
             ),

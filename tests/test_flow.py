@@ -97,11 +97,11 @@ async def env(tmp_path):
     texts = Texts(db)
     await texts.load()
 
-    def user_client(source: str, bot_id: int) -> Client:
+    def user_client(source: str, bot_id: int, language: str | None = None) -> Client:
         dp = Dispatcher()
         dp.include_router(build_user_router())
         return Client(dp, make_bot(bot_id), dict(
-            db=db, texts=texts, source=source,
+            db=db, texts=texts, source=source, language=language or source.lower(),
             channel_id=f"@ch_{source.lower()}", channel_url=f"https://t.me/ch_{source.lower()}"))
 
     yield db, texts, user_client
@@ -112,26 +112,26 @@ async def test_happy_path(env):
     db, texts, user_client = env
     pt = user_client("PT", 9001)
 
-    await pt.message(1, "/start")
-    assert pt.session.texts()[-1].startswith("Choose your language")
-
-    await pt.click(1, "lang:ru")  # язык интерфейса не влияет на пул
-    assert pt.session.texts()[-1] == DEFAULTS["ru"]["sub_prompt"]
+    await pt.message(1, "/start")  # сразу шаг подписки на языке бота, без выбора языка
+    assert pt.session.texts() == [DEFAULTS["pt"]["sub_prompt"]]
+    buttons = pt.session.sent[-1].reply_markup.inline_keyboard
+    assert buttons[0][0].url == "https://t.me/ch_pt"
+    assert buttons[0][0].text == DEFAULTS["pt"]["btn_subscribe"]
 
     await pt.click(1, "check")
-    assert pt.session.texts()[-1] == DEFAULTS["ru"]["not_subscribed"]
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["not_subscribed"]
     assert await db.get_participant(1) is None
 
     pt.session.subscribers.add(1)
     await pt.click(1, "check")
-    assert pt.session.texts()[-1] == DEFAULTS["ru"]["registered"]
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["registered"]
     p = await db.get_participant(1)
-    assert (p["source_channel"], p["bot_language"], p["username"]) == ("PT", "ru", "user1")
+    assert (p["source_channel"], p["bot_language"], p["username"]) == ("PT", "pt", "user1")
     assert (p["subscription_status"], p["participation_status"]) == ("subscribed", "active")
 
     await pt.click(1, "check")  # повторное нажатие
     await pt.message(1, "/start")
-    assert pt.session.texts()[-2:] == [DEFAULTS["ru"]["already"]] * 2
+    assert pt.session.texts()[-2:] == [DEFAULTS["pt"]["already"]] * 2
     assert len(await db.list_participants()) == 1
 
 
@@ -142,14 +142,12 @@ async def test_one_participation_across_bots(env):
     en.session.subscribers.add(5)
 
     await ru.message(5, "/start")
-    await ru.click(5, "lang:es")
     await ru.click(5, "check")
+    assert ru.session.texts()[-1] == DEFAULTS["ru"]["registered"]
 
-    await en.message(5, "/start")  # другой бот — сразу «уже участвуешь»
-    assert en.session.texts() == [DEFAULTS["es"]["already"]]
-    await en.click(5, "lang:en")
+    await en.message(5, "/start")  # другой бот — «уже участвуешь» на языке этого бота
     await en.click(5, "check")
-    assert en.session.texts()[-2:] == [DEFAULTS["en"]["already"]] * 2
+    assert en.session.texts() == [DEFAULTS["en"]["already"]] * 2
 
     assert [p["source_channel"] for p in await db.list_participants()] == ["RU"]
 
@@ -159,9 +157,8 @@ async def test_technical_error_does_not_register(env):
     es = user_client("ES", 9001)
     es.session.fail_membership = True
     await es.message(7, "/start")
-    await es.click(7, "lang:pt")
     await es.click(7, "check")
-    assert es.session.texts()[-1] == DEFAULTS["pt"]["error"]
+    assert es.session.texts()[-1] == DEFAULTS["es"]["error"]
     assert await db.get_participant(7) is None
 
     es.session.fail_membership = False
@@ -176,18 +173,15 @@ async def test_stats_and_pools(env):
     for uid in (1, 2, 3):
         ru.session.subscribers.add(uid)
         await ru.message(uid, "/start")
-        await ru.click(uid, "lang:ru")
     await ru.click(1, "check")
     await ru.click(2, "check")
     pt.session.subscribers.add(10)
     await pt.message(10, "/start")
-    await pt.click(10, "lang:en")
     await pt.click(10, "check")
 
     s = await db.stats()
     assert s["participants"] == {"RU": 2, "PT": 1}
     assert s["started"] == {"RU": 3, "PT": 1}
-    assert s["languages"] == {"ru": 2, "en": 1}
     assert [p["telegram_id"] for p in await db.list_participants("PT")] == [10]
 
 
@@ -197,9 +191,11 @@ async def test_admin_panel(env, monkeypatch):
     started = []
 
     async def fake_start(row):
-        started.append(row["source"])
+        started.append((row["source"], row["language"]))
 
     monkeypatch.setattr(manager, "start", fake_start)
+    monkeypatch.setattr(manager, "is_running", lambda source: True)
+    monkeypatch.setattr("bot.admin.asyncio.sleep", lambda *_: _noop())
     # Проверочные Bot(token) в админке тоже не должны ходить в сеть
     monkeypatch.setattr("bot.admin.Bot", lambda token: make_bot(int(token.split(":")[0])))
 
@@ -212,28 +208,33 @@ async def test_admin_panel(env, monkeypatch):
     await admin.message(5, "/admin")
     assert "Нет доступа" in admin.session.texts()[-1]
 
-    # создание бота
+    # создание бота: код → токен → язык → канал → ссылка
     await admin.message(ADMIN_ID, "/admin")
     await admin.click(ADMIN_ID, "bot_add")
-    await admin.message(ADMIN_ID, "de")
+    await admin.message(ADMIN_ID, "br")
     await admin.message(ADMIN_ID, f"555:{'B' * 35}")
-    await admin.message(ADMIN_ID, "@royal_de")
-    await admin.message(ADMIN_ID, "https://t.me/royal_de")
-    row = await db.get_bot("DE")
-    assert (row["username"], row["channel_id"], row["channel_url"]) == (
-        "new_bot", "@royal_de", "https://t.me/royal_de")
-    assert started == ["DE"]
+    await admin.click(ADMIN_ID, "al:pt")
+    await admin.message(ADMIN_ID, "@royal_br")
+    await admin.message(ADMIN_ID, "https://t.me/royal_br")
+    row = await db.get_bot("BR")
+    assert (row["username"], row["channel_id"], row["channel_url"], row["language"]) == (
+        "new_bot", "@royal_br", "https://t.me/royal_br", "pt")
+    assert started == [("BR", "pt")]
     assert "создан и запущен" in admin.session.texts()[-1]
     assert "⚠️" not in admin.session.texts()[-1]
 
-    # правка текста сразу видна в боте розыгрыша
+    # смена языка бота перезапускает его с новым языком
+    await admin.click(ADMIN_ID, "bl:BR:es")
+    assert (await db.get_bot("BR"))["language"] == "es"
+    assert started[-1] == ("BR", "es")
+
+    # правка текста сразу видна в боте на этом языке
     await admin.click(ADMIN_ID, "te:ru:registered")
     await admin.message(ADMIN_ID, "Новый текст ✨")
     assert texts.get("ru", "registered") == "Новый текст ✨"
     ru = user_client("RU", 9001)
     ru.session.subscribers.add(1)
     await ru.message(1, "/start")
-    await ru.click(1, "lang:ru")
     await ru.click(1, "check")
     assert ru.session.texts()[-1] == "Новый текст ✨"
 
@@ -244,15 +245,45 @@ async def test_admin_panel(env, monkeypatch):
     await admin.click(ADMIN_ID, "tr:ru:registered")
     assert texts.get("ru", "registered") == DEFAULTS["ru"]["registered"]
 
-    # новый язык: появляется в выборе, тексты — английские, пока не переведены
+    # новый язык: тексты английские, пока не переведены
     await admin.click(ADMIN_ID, "lang_add")
     await admin.message(ADMIN_ID, "de")
     await admin.message(ADMIN_ID, "🇩🇪 Deutsch")
     assert texts.languages["de"] == "🇩🇪 Deutsch"
     assert texts.get("de", "already") == DEFAULTS["en"]["already"]
 
+    # язык, назначенный боту, удалить нельзя; свободный — можно
+    await admin.click(ADMIN_ID, "lang_del_ok:es")
+    assert "es" in texts.languages
+    await admin.click(ADMIN_ID, "lang_del_ok:de")
+    assert "de" not in texts.languages
+
     # статистика и экспорт
     await admin.click(ADMIN_ID, "stats")
     await admin.click(ADMIN_ID, "exp:*")
     docs = [m for m in admin.session.sent if isinstance(m, SendDocument)]
     assert len(docs) == 1 and b"telegram_id;username" in docs[0].document.data
+
+
+async def _noop():
+    return None
+
+
+async def test_migrates_database_without_bot_language(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE bots (source TEXT PRIMARY KEY, token TEXT NOT NULL UNIQUE, username TEXT, "
+        "channel_id TEXT NOT NULL, channel_url TEXT NOT NULL, "
+        "is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)"
+    )
+    old.execute("INSERT INTO bots VALUES ('RU', '1:x', 'b', '@c', 'https://t.me/c', 1, '2026-01-01')")
+    old.commit()
+    old.close()
+
+    db = Database(path)
+    await db.connect(DEFAULT_LANGUAGES)
+    assert (await db.get_bot("RU"))["language"] == "en"
+    await db.close()

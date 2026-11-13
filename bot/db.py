@@ -12,11 +12,12 @@ CREATE TABLE IF NOT EXISTS bots (
     username    TEXT,
     channel_id  TEXT NOT NULL,
     channel_url TEXT NOT NULL,
+    language    TEXT NOT NULL DEFAULT 'en',
     is_active   INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL
 );
 
--- Языки интерфейса
+-- Языки (наборы фраз). Каждый бот работает на одном языке.
 CREATE TABLE IF NOT EXISTS languages (
     code     TEXT PRIMARY KEY,
     title    TEXT NOT NULL,
@@ -31,7 +32,7 @@ CREATE TABLE IF NOT EXISTS texts (
     PRIMARY KEY (language, key)
 );
 
--- Все, кто нажал Start в каком-либо боте (воронка + выбранный язык)
+-- Все, кто нажал Start в каком-либо боте (воронка)
 CREATE TABLE IF NOT EXISTS users (
     telegram_id    INTEGER NOT NULL,
     source_channel TEXT    NOT NULL,
@@ -75,6 +76,9 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.executescript(SCHEMA)
+        columns = {row["name"] for row in await self._all("PRAGMA table_info(bots)")}
+        if "language" not in columns:  # база, созданная до появления языка бота
+            await self.conn.execute("ALTER TABLE bots ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
         if default_languages and not await self.list_languages():
             for position, (code, title) in enumerate(default_languages.items()):
                 await self.conn.execute(
@@ -108,14 +112,21 @@ class Database:
         return await self._one("SELECT * FROM bots WHERE source = ?", (source,))
 
     async def add_bot(
-        self, source: str, token: str, username: str | None, channel_id: str, channel_url: str
+        self,
+        source: str,
+        token: str,
+        username: str | None,
+        channel_id: str,
+        channel_url: str,
+        language: str,
     ) -> bool:
         """False — бот с таким кодом пула или токеном уже есть."""
         try:
             await self._write(
-                "INSERT INTO bots (source, token, username, channel_id, channel_url, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (source, token, username, channel_id, channel_url, _now()),
+                "INSERT INTO bots "
+                "(source, token, username, channel_id, channel_url, language, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (source, token, username, channel_id, channel_url, language, _now()),
             )
             return True
         except sqlite3.IntegrityError:
@@ -127,6 +138,9 @@ class Database:
             "UPDATE bots SET channel_id = ?, channel_url = ? WHERE source = ?",
             (channel_id, channel_url, source),
         )
+
+    async def set_bot_language(self, source: str, language: str) -> None:
+        await self._write("UPDATE bots SET language = ? WHERE source = ?", (language, source))
 
     async def set_bot_active(self, source: str, active: bool) -> None:
         await self._write("UPDATE bots SET is_active = ? WHERE source = ?", (int(active), source))
@@ -178,21 +192,6 @@ class Database:
                ON CONFLICT (telegram_id, source_channel) DO UPDATE SET username = excluded.username""",
             (telegram_id, source, username, _now()),
         )
-
-    async def set_language(self, telegram_id: int, source: str, language: str) -> None:
-        await self._write(
-            """INSERT INTO users (telegram_id, source_channel, language, started_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT (telegram_id, source_channel) DO UPDATE SET language = excluded.language""",
-            (telegram_id, source, language, _now()),
-        )
-
-    async def get_language(self, telegram_id: int, source: str) -> str | None:
-        row = await self._one(
-            "SELECT language FROM users WHERE telegram_id = ? AND source_channel = ?",
-            (telegram_id, source),
-        )
-        return row["language"] if row else None
 
     # --- participants ----------------------------------------------------
 
@@ -258,8 +257,5 @@ class Database:
             "unsubscribed": await grouped(
                 "SELECT source_channel, COUNT(*) FROM participants "
                 "WHERE subscription_status != 'subscribed' GROUP BY source_channel"
-            ),
-            "languages": await grouped(
-                "SELECT bot_language, COUNT(*) FROM participants GROUP BY bot_language"
             ),
         }

@@ -1,5 +1,3 @@
-CHOOSE_LANGUAGE = "Choose your language / Выберите язык / Escolha o idioma / Elige tu idioma"
-
 DEFAULT_LANGUAGES = {
     "ru": "🇷🇺 Русский",
     "en": "🇬🇧 English",
@@ -104,9 +102,6 @@ KEY_LABELS = {
     "error": "Техническая ошибка",
 }
 
-GLOBAL = "*"  # «язык» для общих текстов (приглашение выбрать язык)
-CHOOSE_KEY = "choose_language"
-
 
 class Texts:
     """Тексты бота: значения по умолчанию + правки из админки (таблица texts)."""
@@ -122,8 +117,6 @@ class Texts:
 
     @staticmethod
     def default(language: str, key: str) -> str:
-        if language == GLOBAL:
-            return CHOOSE_LANGUAGE
         return DEFAULTS.get(language, DEFAULTS["en"])[key]
 
     def get(self, language: str | None, key: str) -> str:
@@ -132,9 +125,6 @@ class Texts:
 
     def is_overridden(self, language: str, key: str) -> bool:
         return (language, key) in self.overrides
-
-    def choose_prompt(self) -> str:
-        return self.get(GLOBAL, CHOOSE_KEY)
 
     async def set(self, language: str, key: str, value: str) -> None:
         await self.db.set_text(language, key, value)
