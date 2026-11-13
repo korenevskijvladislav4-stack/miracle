@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS users (
     username       TEXT,
     language       TEXT,
     started_at     TEXT    NOT NULL,
+    ref            TEXT,                       -- метка из deep link (?start=...)
+    awaiting_code  INTEGER NOT NULL DEFAULT 0, -- подписка подтверждена, ждём код
     PRIMARY KEY (telegram_id, source_channel)
 );
 
@@ -53,7 +55,9 @@ CREATE TABLE IF NOT EXISTS participants (
     subscription_status     TEXT NOT NULL DEFAULT 'subscribed',
     participation_status    TEXT NOT NULL DEFAULT 'active',
     registered_at           TEXT NOT NULL,
-    subscription_checked_at TEXT
+    subscription_checked_at TEXT,
+    code                    TEXT,  -- код с лендинга (на участие не влияет)
+    ref                     TEXT   -- источник: метка из deep link
 );
 CREATE INDEX IF NOT EXISTS idx_participants_source ON participants (source_channel);
 """
@@ -76,9 +80,17 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.executescript(SCHEMA)
-        columns = {row["name"] for row in await self._all("PRAGMA table_info(bots)")}
-        if "language" not in columns:  # база, созданная до появления языка бота
-            await self.conn.execute("ALTER TABLE bots ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
+        # Колонки, появившиеся после первой версии базы
+        for table, column, ddl in (
+            ("bots", "language", "TEXT NOT NULL DEFAULT 'en'"),
+            ("users", "ref", "TEXT"),
+            ("users", "awaiting_code", "INTEGER NOT NULL DEFAULT 0"),
+            ("participants", "code", "TEXT"),
+            ("participants", "ref", "TEXT"),
+        ):
+            existing = {row["name"] for row in await self._all(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         if default_languages and not await self.list_languages():
             for position, (code, title) in enumerate(default_languages.items()):
                 await self.conn.execute(
@@ -185,12 +197,29 @@ class Database:
 
     # --- users -----------------------------------------------------------
 
-    async def touch_user(self, telegram_id: int, source: str, username: str | None) -> None:
+    async def touch_user(
+        self, telegram_id: int, source: str, username: str | None, ref: str | None = None
+    ) -> None:
+        """Фиксирует вход в бота. Источник (ref) запоминается по первому касанию."""
         await self._write(
-            """INSERT INTO users (telegram_id, source_channel, username, started_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT (telegram_id, source_channel) DO UPDATE SET username = excluded.username""",
-            (telegram_id, source, username, _now()),
+            """INSERT INTO users (telegram_id, source_channel, username, started_at, ref)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (telegram_id, source_channel) DO UPDATE SET
+                   username = excluded.username,
+                   ref = COALESCE(users.ref, excluded.ref)""",
+            (telegram_id, source, username, _now(), ref),
+        )
+
+    async def get_user(self, telegram_id: int, source: str) -> aiosqlite.Row | None:
+        return await self._one(
+            "SELECT * FROM users WHERE telegram_id = ? AND source_channel = ?",
+            (telegram_id, source),
+        )
+
+    async def set_awaiting_code(self, telegram_id: int, source: str) -> None:
+        await self._write(
+            "UPDATE users SET awaiting_code = 1 WHERE telegram_id = ? AND source_channel = ?",
+            (telegram_id, source),
         )
 
     # --- participants ----------------------------------------------------
@@ -205,15 +234,17 @@ class Database:
         full_name: str | None,
         language: str,
         source: str,
+        code: str | None = None,
+        ref: str | None = None,
     ) -> bool:
         """True — участник создан; False — этот Telegram ID уже участвует."""
         try:
             await self._write(
                 """INSERT INTO participants
                    (telegram_id, username, full_name, bot_language, source_channel,
-                    registered_at, subscription_checked_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (telegram_id, username, full_name, language, source, _now(), _now()),
+                    registered_at, subscription_checked_at, code, ref)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (telegram_id, username, full_name, language, source, _now(), _now(), code, ref),
             )
             return True
         except sqlite3.IntegrityError:
@@ -236,6 +267,18 @@ class Database:
         return await self._all("SELECT * FROM participants ORDER BY source_channel, registered_at")
 
     # --- stats -----------------------------------------------------------
+
+    async def ref_stats(self) -> list[aiosqlite.Row]:
+        """По каждому пулу и источнику: сколько нажали Start и сколько зарегистрировались."""
+        return await self._all(
+            """SELECT u.source_channel AS pool, COALESCE(u.ref, '') AS ref,
+                      COUNT(*) AS started, COUNT(p.telegram_id) AS joined
+               FROM users u
+               LEFT JOIN participants p
+                      ON p.telegram_id = u.telegram_id AND p.source_channel = u.source_channel
+               GROUP BY u.source_channel, COALESCE(u.ref, '')
+               ORDER BY u.source_channel, started DESC, ref"""
+        )
 
     async def stats(self) -> dict[str, dict[str, int]]:
         async def grouped(sql: str, params: tuple = ()) -> dict[str, int]:

@@ -112,7 +112,7 @@ async def test_happy_path(env):
     db, texts, user_client = env
     pt = user_client("PT", 9001)
 
-    await pt.message(1, "/start")  # сразу шаг подписки на языке бота, без выбора языка
+    await pt.message(1, "/start partner_123")  # deep link: t.me/bot?start=partner_123
     assert pt.session.texts() == [DEFAULTS["pt"]["sub_prompt"]]
     buttons = pt.session.sent[-1].reply_markup.inline_keyboard
     assert buttons[0][0].url == "https://t.me/ch_pt"
@@ -122,10 +122,24 @@ async def test_happy_path(env):
     assert pt.session.texts()[-1] == DEFAULTS["pt"]["not_subscribed"]
     assert await db.get_participant(1) is None
 
+    await pt.message(1, "RG-A7K3X")  # код до подтверждения подписки не принимается
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["sub_prompt"]
+
     pt.session.subscribers.add(1)
     await pt.click(1, "check")
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["subscribed"]
+    assert await db.get_participant(1) is None  # без кода участия ещё нет
+
+    await pt.message(1, "/start instagram")  # повторный вход: шаг кода, метка не меняется
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["subscribed"]
+    await pt.message(1, "это не код")
+    assert pt.session.texts()[-1] == DEFAULTS["pt"]["code_invalid"]
+    assert await db.get_participant(1) is None
+
+    await pt.message(1, " rg-a7k3x ")
     assert pt.session.texts()[-1] == DEFAULTS["pt"]["registered"]
     p = await db.get_participant(1)
+    assert (p["code"], p["ref"]) == ("RG-A7K3X", "partner_123")
     assert (p["source_channel"], p["bot_language"], p["username"]) == ("PT", "pt", "user1")
     assert (p["subscription_status"], p["participation_status"]) == ("subscribed", "active")
 
@@ -143,11 +157,13 @@ async def test_one_participation_across_bots(env):
 
     await ru.message(5, "/start")
     await ru.click(5, "check")
+    await ru.message(5, "CODE1")
     assert ru.session.texts()[-1] == DEFAULTS["ru"]["registered"]
 
     await en.message(5, "/start")  # другой бот — «уже участвуешь» на языке этого бота
     await en.click(5, "check")
-    assert en.session.texts() == [DEFAULTS["en"]["already"]] * 2
+    await en.message(5, "CODE2")
+    assert en.session.texts() == [DEFAULTS["en"]["already"]] * 3
 
     assert [p["source_channel"] for p in await db.list_participants()] == ["RU"]
 
@@ -164,25 +180,34 @@ async def test_technical_error_does_not_register(env):
     es.session.fail_membership = False
     es.session.subscribers.add(7)
     await es.click(7, "check")
+    await es.message(7, "CODE7")
     assert (await db.get_participant(7))["source_channel"] == "ES"
 
 
 async def test_stats_and_pools(env):
     db, texts, user_client = env
     ru, pt = user_client("RU", 9001), user_client("PT", 9002)
-    for uid in (1, 2, 3):
+    for uid, ref in ((1, "insta"), (2, "insta"), (3, "")):
         ru.session.subscribers.add(uid)
-        await ru.message(uid, "/start")
-    await ru.click(1, "check")
-    await ru.click(2, "check")
+        await ru.message(uid, f"/start {ref}".strip())
+    for uid in (1, 3):
+        await ru.click(uid, "check")
+        await ru.message(uid, f"CODE{uid}")
     pt.session.subscribers.add(10)
-    await pt.message(10, "/start")
+    await pt.message(10, "/start lk")
+    await pt.message(10, "/start <b>bad ref</b>")  # недопустимая метка игнорируется
     await pt.click(10, "check")
+    await pt.message(10, "CODE10")
 
     s = await db.stats()
     assert s["participants"] == {"RU": 2, "PT": 1}
     assert s["started"] == {"RU": 3, "PT": 1}
     assert [p["telegram_id"] for p in await db.list_participants("PT")] == [10]
+    assert [tuple(r) for r in await db.ref_stats()] == [
+        ("PT", "lk", 1, 1),
+        ("RU", "insta", 2, 1),
+        ("RU", "", 1, 1),
+    ]
 
 
 async def test_admin_panel(env, monkeypatch):
@@ -234,8 +259,9 @@ async def test_admin_panel(env, monkeypatch):
     assert texts.get("ru", "registered") == "Новый текст ✨"
     ru = user_client("RU", 9001)
     ru.session.subscribers.add(1)
-    await ru.message(1, "/start")
+    await ru.message(1, "/start promo")
     await ru.click(1, "check")
+    await ru.message(1, "RG-1")
     assert ru.session.texts()[-1] == "Новый текст ✨"
 
     # правки переживают перезапуск, сброс возвращает стандартный текст
@@ -260,9 +286,14 @@ async def test_admin_panel(env, monkeypatch):
 
     # статистика и экспорт
     await admin.click(ADMIN_ID, "stats")
+    await admin.click(ADMIN_ID, "refs")
+    await admin.click(ADMIN_ID, "bot:BR")
     await admin.click(ADMIN_ID, "exp:*")
     docs = [m for m in admin.session.sent if isinstance(m, SendDocument)]
-    assert len(docs) == 1 and b"telegram_id;username" in docs[0].document.data
+    assert len(docs) == 1
+    header, row = docs[0].document.data.decode("utf-8-sig").splitlines()[:2]
+    assert header.endswith(";registered_at;code;ref")
+    assert row.endswith(";RG-1;promo")
 
 
 async def _noop():
@@ -286,4 +317,7 @@ async def test_migrates_database_without_bot_language(tmp_path):
     db = Database(path)
     await db.connect(DEFAULT_LANGUAGES)
     assert (await db.get_bot("RU"))["language"] == "en"
+    await db.touch_user(1, "RU", "u", "ref1")  # новые колонки users/participants тоже на месте
+    await db.set_awaiting_code(1, "RU")
+    assert await db.register(1, "u", "U", "en", "RU", "CODE", "ref1")
     await db.close()

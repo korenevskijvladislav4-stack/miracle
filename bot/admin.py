@@ -110,7 +110,7 @@ def build_admin_router(cfg: Config) -> Router:
             event,
             "<b>MIRACLE GLOW — админка</b>",
             kb(
-                [("📊 Статистика", "stats")],
+                [("📊 Статистика", "stats"), ("🔗 Источники", "refs")],
                 [("🤖 Боты", "bots"), ("🌐 Тексты и языки", "texts")],
                 [("📥 Экспорт участников", "export")],
                 [("🔄 Перепроверить подписки", "recheck")],
@@ -148,6 +148,29 @@ def build_admin_router(cfg: Config) -> Router:
         lines += ["", "<i>«Отписались» обновляется кнопкой «Перепроверить подписки».</i>"]
         await show(callback, "\n".join(lines), kb([("🔄 Обновить", "stats")], BACK_MENU))
 
+    @router.callback_query(F.data == "refs")
+    async def on_refs(callback: CallbackQuery, db: Database) -> None:
+        lines = ["<b>Источники (метки deep link)</b>", ""]
+        pool = None
+        for r in await db.ref_stats():
+            if r["pool"] != pool:
+                pool = r["pool"]
+                lines.append(f"<b>{escape(pool)}</b>")
+            name = f"<code>{escape(r['ref'])}</code>" if r["ref"] else "без метки"
+            lines.append(f"   {name}: Start — {r['started']}, участников — {r['joined']}")
+        if pool is None:
+            lines.append("Пока никто не запускал ботов.")
+        lines += [
+            "",
+            "Метка задаётся в ссылке на бота: <code>t.me/бот?start=метка</code> "
+            "(латиница, цифры, «_» и «-», до 64 символов). "
+            "Запоминается первая метка, с которой пришёл пользователь.",
+        ]
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3900] + "\n…\nПолный список — в экспорте (колонка ref)."
+        await show(callback, text, kb([("🔄 Обновить", "refs")], BACK_MENU))
+
     # --- боты -------------------------------------------------------------
 
     @router.callback_query(F.data == "bots")
@@ -183,7 +206,8 @@ def build_admin_router(cfg: Config) -> Router:
             f"Язык: {escape(texts.languages.get(b['language'], b['language']))}\n"
             f"Канал: <code>{escape(b['channel_id'])}</code>\n"
             f"Ссылка: {escape(b['channel_url'])}\n"
-            f"Участников в пуле: {count}",
+            f"Участников в пуле: {count}\n\n"
+            f"Ссылка с меткой источника:\n<code>https://t.me/{escape(b['username'] or '')}?start=МЕТКА</code>",
             kb(
                 [("⏸ Выключить" if b["is_active"] else "▶️ Включить", f"bot_toggle:{source}")],
                 [("🌐 Изменить язык", f"bot_lang:{source}"), ("✏️ Изменить канал", f"bot_chan:{source}")],
@@ -594,7 +618,7 @@ def build_admin_router(cfg: Config) -> Router:
             return
         columns = [
             "telegram_id", "username", "full_name", "bot_language", "source_channel",
-            "subscription_status", "participation_status", "registered_at",
+            "subscription_status", "participation_status", "registered_at", "code", "ref",
         ]
         buffer = io.StringIO()
         writer = csv.writer(buffer, delimiter=";")
