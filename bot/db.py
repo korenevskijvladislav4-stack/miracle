@@ -266,6 +266,25 @@ class Database:
             )
         return await self._all("SELECT * FROM participants ORDER BY source_channel, registered_at")
 
+    async def list_user_rows(self, telegram_id: int) -> list[aiosqlite.Row]:
+        return await self._all(
+            "SELECT * FROM users WHERE telegram_id = ? ORDER BY started_at", (telegram_id,)
+        )
+
+    async def delete_user(self, telegram_id: int) -> bool:
+        """Полный сброс пользователя: участие и следы входа во все боты.
+
+        После этого он проходит сценарий с нуля (подписка -> код) в любом боте.
+        """
+        cur = await self.conn.execute(
+            "DELETE FROM participants WHERE telegram_id = ?", (telegram_id,)
+        )
+        deleted = cur.rowcount
+        cur = await self.conn.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+        deleted += cur.rowcount
+        await self.conn.commit()
+        return deleted > 0
+
     # --- stats -----------------------------------------------------------
 
     async def ref_stats(self) -> list[aiosqlite.Row]:

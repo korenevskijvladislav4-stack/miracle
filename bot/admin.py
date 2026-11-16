@@ -46,6 +46,10 @@ class EditChannel(StatesGroup):
     channel_url = State()
 
 
+class FindUser(StatesGroup):
+    telegram_id = State()
+
+
 class EditText(StatesGroup):
     value = State()
 
@@ -112,7 +116,7 @@ def build_admin_router(cfg: Config) -> Router:
             kb(
                 [("📊 Статистика", "stats"), ("🔗 Источники", "refs")],
                 [("🤖 Боты", "bots"), ("🌐 Тексты и языки", "texts")],
-                [("📥 Экспорт участников", "export")],
+                [("📥 Экспорт участников", "export"), ("👤 Участник", "user")],
                 [("🔄 Перепроверить подписки", "recheck")],
             ),
         )
@@ -596,6 +600,72 @@ def build_admin_router(cfg: Config) -> Router:
         if len(texts.languages) > 1 and not in_use:
             await texts.delete_language(code)
         await on_texts(callback, state, texts)
+
+    # --- участник: поиск и удаление ---------------------------------------
+
+    @router.callback_query(F.data == "user")
+    async def on_user(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(FindUser.telegram_id)
+        me = callback.from_user.id
+        await show(
+            callback,
+            "<b>Участник</b>\n\nПришлите Telegram ID пользователя, чтобы посмотреть его "
+            "или удалить (например, для повторного теста).",
+            kb([(f"Это я ({me})", f"user:{me}")], [("Отмена", "menu")]),
+        )
+
+    async def user_card(event, db: Database, telegram_id: int) -> None:
+        p = await db.get_participant(telegram_id)
+        visits = await db.list_user_rows(telegram_id)
+        lines = [f"<b>Пользователь</b> <code>{telegram_id}</code>", ""]
+        if p:
+            lines += [
+                f"Участвует в пуле <b>{escape(p['source_channel'])}</b>",
+                f"Username: {'@' + escape(p['username']) if p['username'] else '—'}",
+                f"Код: <code>{escape(p['code'] or '—')}</code>",
+                f"Источник: <code>{escape(p['ref'] or '—')}</code>",
+                f"Подписка: {p['subscription_status']}",
+                f"Зарегистрирован: {p['registered_at']} UTC",
+            ]
+        else:
+            lines.append("Не участвует в розыгрыше.")
+        if visits:
+            lines += ["", "Заходил в ботов: " + ", ".join(escape(v["source_channel"]) for v in visits)]
+        if not p and not visits:
+            await show(event, "\n".join(lines), kb([("Найти другого", "user")], BACK_MENU))
+            return
+        lines += ["", "Удаление стирает участие и историю входов — пользователь сможет пройти всё заново."]
+        await show(
+            event,
+            "\n".join(lines),
+            kb([("🗑 Удалить", f"user_del:{telegram_id}")], [("Найти другого", "user")], BACK_MENU),
+        )
+
+    @router.message(FindUser.telegram_id, F.text)
+    async def on_user_id(message: Message, state: FSMContext, db: Database) -> None:
+        raw = message.text.strip()
+        if not raw.isdigit():
+            await message.answer("Telegram ID — это число. Пришлите ещё раз.", reply_markup=CANCEL)
+            return
+        await state.clear()
+        await user_card(message, db, int(raw))
+
+    @router.callback_query(F.data.startswith("user:"))
+    async def on_user_card(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+        await state.clear()
+        await user_card(callback, db, int(callback.data.split(":", 1)[1]))
+
+    @router.callback_query(F.data.startswith("user_del:"))
+    async def on_user_del(callback: CallbackQuery, db: Database) -> None:
+        telegram_id = int(callback.data.split(":", 1)[1])
+        deleted = await db.delete_user(telegram_id)
+        await show(
+            callback,
+            f"Пользователь <code>{telegram_id}</code> удалён ✅ Он может пройти регистрацию заново."
+            if deleted
+            else f"Пользователь <code>{telegram_id}</code> уже удалён.",
+            kb([("Найти другого", "user")], BACK_MENU),
+        )
 
     # --- экспорт ----------------------------------------------------------
 

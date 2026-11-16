@@ -300,6 +300,37 @@ async def _noop():
     return None
 
 
+async def test_admin_deletes_participant_for_retest(env):
+    db, texts, user_client = env
+    ru, en = user_client("RU", 9001), user_client("EN", 9002)
+    ru.session.subscribers.add(1)
+    en.session.subscribers.add(1)
+    await ru.message(1, "/start first")
+    await ru.click(1, "check")
+    await ru.message(1, "CODE1")
+    assert await db.get_participant(1)
+
+    cfg = Config("1:x", frozenset({ADMIN_ID}), "")
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(build_admin_router(cfg))
+    admin = Client(dp, make_bot(100), dict(db=db, texts=texts, manager=BotManager(db, texts)))
+
+    await admin.click(ADMIN_ID, "user")
+    await admin.message(ADMIN_ID, "1")
+    assert "Участвует в пуле <b>RU</b>" in admin.session.texts()[-1]
+    await admin.click(ADMIN_ID, "user_del:1")
+    assert await db.get_participant(1) is None
+    assert await db.list_user_rows(1) == []
+
+    # после удаления сценарий идёт с нуля — и можно зарегистрироваться в другом боте
+    await en.message(1, "/start second")
+    assert en.session.texts()[-1] == DEFAULTS["en"]["sub_prompt"]
+    await en.click(1, "check")
+    await en.message(1, "CODE2")
+    p = await db.get_participant(1)
+    assert (p["source_channel"], p["code"], p["ref"]) == ("EN", "CODE2", "second")
+
+
 async def test_migrates_database_without_bot_language(tmp_path):
     import sqlite3
 
